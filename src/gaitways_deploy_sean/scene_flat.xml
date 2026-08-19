@@ -1,0 +1,106 @@
+<mujoco model="go2 flat scene tuned">
+  <!--
+    This scene is versioned with policy_action_controller so simulator tuning
+    lives next to the policy stack instead of being edited inside
+    unitree_mujoco.
+
+    Recommended defaults for Go2 locomotion on flat ground:
+    - integrator="implicitfast": MuJoCo recommends this for most models and it
+      is usually a strict stability/performance improvement over Euler.
+    - cone="elliptic" + solver="Newton": higher-fidelity friction/contact than
+      the faster but rougher pyramidal/PGS family.
+    - jacobian="dense": Go2 is a small model, and auto already resolves to
+      dense for nv <= 60; writing it explicitly makes the choice obvious.
+    - timestep="0.001": more conservative than the default 0.002 when contacts
+      are important.
+    - noslip_iterations > 0: helps reduce stance-foot drift on flat ground.
+
+    Note:
+    - There is no universal "most realistic" MuJoCo config.
+    - For contact-rich legged motion, this file is tuned toward higher-fidelity
+      contact behavior rather than maximum real-time speed.
+    - Some realism-critical robot parameters still live in upstream go2.xml:
+      inertias, joint damping/frictionloss, foot contact geometry, etc.
+    - Contact override is written here for visibility, but kept disabled by
+      default so per-geom contact parameters in go2.xml remain active.
+    - This file is meant to be launched via run_go2_flat_sim.sh, which copies
+      it into unitree_mujoco's go2 model directory so relative asset paths in
+      go2.xml continue to work.
+  -->
+  <include file="go2.xml"/>
+
+  <option
+    timestep="0.001"
+    apirate="100"
+    impratio="100"
+    tolerance="1e-8"
+    ls_tolerance="0.01"
+    noslip_tolerance="1e-8"
+    ccd_tolerance="1e-6"
+    gravity="0 0 -9.81"
+    wind="0 0 0"
+    magnetic="0 -0.5 0"
+    density="0"
+    viscosity="0"
+    o_margin="0"
+    o_solref="0.02 1"
+    o_solimp="0.9 0.95 0.001 0.5 2"
+    o_friction="1 1 0.005 0.0001 0.0001"
+    integrator="implicitfast"
+    cone="elliptic"
+    jacobian="dense"
+    solver="Newton"
+    iterations="100"
+    ls_iterations="50"
+    noslip_iterations="8"
+    ccd_iterations="50"
+    sdf_iterations="10"
+    sdf_initpoints="40">
+    <flag override="disable"/>
+  </option>
+
+  <statistic center="0 0 0.1" extent="0.8"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture
+      type="skybox"
+      builtin="gradient"
+      rgb1="0.3 0.5 0.7"
+      rgb2="0 0 0"
+      width="512"
+      height="3072"/>
+    <texture
+      type="2d"
+      name="groundplane"
+      builtin="checker"
+      mark="edge"
+      rgb1="0.2 0.3 0.4"
+      rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8"
+      width="300"
+      height="300"/>
+    <material
+      name="groundplane"
+      texture="groundplane"
+      texuniform="true"
+      texrepeat="5 5"
+      reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+    <geom
+      name="floor"
+      size="0 0 0.05"
+      type="plane"
+      material="groundplane"
+      condim="6"
+      friction="0.8 0.02 0.01"/>
+  </worldbody>
+</mujoco>
