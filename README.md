@@ -1,4 +1,4 @@
-Steps:
+# Steps:
 
 git clone --recurse-submodules https://github.com/Foresteh/gaitways_deploy_sean.git ~/ros2_ws
 
