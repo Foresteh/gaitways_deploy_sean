@@ -39,15 +39,15 @@ HOW TO USE
 ------------------------------------------------------------------------
 """
 
-from __future__ import annotations
-
 import ctypes
 import math
+import struct
 from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+from crccheck.crc import Crc32Mpeg2
 
 from unitree_go.msg import LowCmd  # type: ignore
 
@@ -90,87 +90,12 @@ HARD_UPPER_LIMITS = [
 # Maps "policy's internal joint order" -> "your physical joint order".
 POLICY_ORDER_INDICES = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]
 
-# Maps LowCmd/LowState's motor array slot -> the same physical joint order
-# used above.
+# Maps LowCmd/LowState's motor array slot -> the same physical joint order=
 DEPLOYMENT_ORDER_INDICES = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
 
 DEFAULT_ACTION_SCALE = 0.25
-MOTOR_MODE = 0x01
 MOTOR_KP = 25.0
 MOTOR_KD = 0.5
-
-
-# --- LowCmd CRC: required part of the Unitree message format ---------------
-
-class _RawMotorCmd(ctypes.Structure):
-    _fields_ = [
-        ("mode", ctypes.c_uint8), ("q", ctypes.c_float), ("dq", ctypes.c_float),
-        ("tau", ctypes.c_float), ("kp", ctypes.c_float), ("kd", ctypes.c_float),
-        ("reserve", ctypes.c_uint32 * 3),
-    ]
-
-
-class _RawBmsCmd(ctypes.Structure):
-    _fields_ = [("off", ctypes.c_uint8), ("reserve", ctypes.c_uint8 * 3)]
-
-
-class _RawLowCmd(ctypes.Structure):
-    _fields_ = [
-        ("head", ctypes.c_uint8 * 2), ("level_flag", ctypes.c_uint8),
-        ("frame_reserve", ctypes.c_uint8), ("sn", ctypes.c_uint32 * 2),
-        ("version", ctypes.c_uint32 * 2), ("bandwidth", ctypes.c_uint16),
-        ("motor_cmd", _RawMotorCmd * 20), ("bms_cmd", _RawBmsCmd),
-        ("wireless_remote", ctypes.c_uint8 * 40), ("led", ctypes.c_uint8 * 12),
-        ("fan", ctypes.c_uint8 * 2), ("gpio", ctypes.c_uint8),
-        ("reserve", ctypes.c_uint32), ("crc", ctypes.c_uint32),
-    ]
-
-
-def _crc32_core(words: list[int]) -> int:
-    crc = 0xFFFFFFFF
-    polynomial = 0x04C11DB7
-    for data in words:
-        xbit = 1 << 31
-        for _ in range(32):
-            crc = ((crc << 1) & 0xFFFFFFFF) ^ polynomial if crc & 0x80000000 else (crc << 1) & 0xFFFFFFFF
-            if data & xbit:
-                crc ^= polynomial
-            xbit >>= 1
-    return crc & 0xFFFFFFFF
-
-
-def _fill_crc(msg: LowCmd) -> None:
-    raw = _RawLowCmd()
-    raw.head[0], raw.head[1] = int(msg.head[0]), int(msg.head[1])
-    raw.level_flag = int(msg.level_flag)
-    raw.frame_reserve = int(msg.frame_reserve)
-    raw.sn[0], raw.sn[1] = int(msg.sn[0]), int(msg.sn[1])
-    raw.version[0], raw.version[1] = int(msg.version[0]), int(msg.version[1])
-    raw.bandwidth = int(msg.bandwidth)
-    for i in range(20):
-        raw.motor_cmd[i].mode = int(msg.motor_cmd[i].mode)
-        raw.motor_cmd[i].q = float(msg.motor_cmd[i].q)
-        raw.motor_cmd[i].dq = float(msg.motor_cmd[i].dq)
-        raw.motor_cmd[i].tau = float(msg.motor_cmd[i].tau)
-        raw.motor_cmd[i].kp = float(msg.motor_cmd[i].kp)
-        raw.motor_cmd[i].kd = float(msg.motor_cmd[i].kd)
-        for j in range(3):
-            raw.motor_cmd[i].reserve[j] = int(msg.motor_cmd[i].reserve[j])
-    raw.bms_cmd.off = int(msg.bms_cmd.off)
-    for i in range(3):
-        raw.bms_cmd.reserve[i] = int(msg.bms_cmd.reserve[i])
-    for i in range(40):
-        raw.wireless_remote[i] = int(msg.wireless_remote[i])
-    for i in range(12):
-        raw.led[i] = int(msg.led[i])
-    for i in range(2):
-        raw.fan[i] = int(msg.fan[i])
-    raw.gpio = int(msg.gpio)
-    raw.reserve = int(msg.reserve)
-    size = ctypes.sizeof(_RawLowCmd) - ctypes.sizeof(ctypes.c_uint32)
-    data = ctypes.string_at(ctypes.byref(raw), size)
-    words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, size, 4)]
-    msg.crc = _crc32_core(words)
 
 
 def _rpy_to_projected_gravity(rpy: Sequence[float]) -> list[float]:
@@ -187,15 +112,13 @@ def _rpy_to_projected_gravity(rpy: Sequence[float]) -> list[float]:
 class _FiLM(nn.Module):
     """Lets a small 'gait id' signal modulate the memory layer's input."""
 
-    def __init__(self, cond_dim: int, feat_dim: int) -> None:
+    def __init__(self, gait_code_dim: int, observation_dim: int) -> None:
         super().__init__()
-        self.to_gb = nn.Linear(cond_dim, 2 * feat_dim)
-        nn.init.zeros_(self.to_gb.weight)
-        nn.init.zeros_(self.to_gb.bias)
+        self.to_gb = nn.Linear(gait_code_dim, 2 * observation_dim)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        gamma, beta = self.to_gb(cond).chunk(2, dim=-1)
-        return (1.0 + gamma) * x + beta
+    def forward(self, observation: torch.Tensor, gait_code: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.to_gb(gait_code).chunk(2, dim=-1)
+        return (1.0 + gamma) * observation + beta
 
 
 class _RecurrentMemory(nn.Module):
@@ -208,14 +131,18 @@ class _RecurrentMemory(nn.Module):
         self.gait_emb = nn.Embedding(4, 2)
         self.film_in = _FiLM(2, input_size)
 
-    @staticmethod
-    def _gait_binary(gait_id: torch.Tensor) -> torch.Tensor:
-        return torch.stack([(gait_id >> 1) & 1, gait_id & 1], dim=-1).float()
+    # 2-bit binary code per gait id 
+    # 0 trot -> [0,0], 1 pronk -> [0,1], 2 pace -> [1,0], 3 bound -> [1,1].
+    _GAIT_BINARY = torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gait_id = torch.round(x[..., -1]).long()
-        cond = self._gait_binary(gait_id)
-        modulated_input = self.film_in(x, cond)
+    @classmethod
+    def _gait_binary(cls, gait_id: torch.Tensor) -> torch.Tensor:
+        return cls._GAIT_BINARY.to(gait_id.device)[gait_id]
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        gait_id = torch.round(observation[..., -1]).long()
+        gait_code = self._gait_binary(gait_id)
+        modulated_input = self.film_in(observation, gait_code)
         out, self.hidden_states = self.rnn(modulated_input.unsqueeze(0), self.hidden_states)
         return out.squeeze(0)
 
@@ -261,8 +188,8 @@ class _EstimatorMemory(nn.Module):
         self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=1)
         self.hidden_states = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, self.hidden_states = self.rnn(x.unsqueeze(0), self.hidden_states)
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        out, self.hidden_states = self.rnn(observation.unsqueeze(0), self.hidden_states)
         return out.squeeze(0)
 
     def reset(self) -> None:
@@ -458,7 +385,7 @@ class GaitwaysPolicy:
         for motor_idx in range(NUM_JOINTS):
             base_idx = DEPLOYMENT_ORDER_INDICES[motor_idx]
             motor = cmd.motor_cmd[motor_idx]
-            motor.mode = MOTOR_MODE
+            motor.mode = 0x01
             motor.q = float(target_joint_angles[base_idx])
             motor.dq = 0.0
             motor.kp = MOTOR_KP
@@ -532,6 +459,62 @@ class GaitwaysPolicy:
         actor.to(device).eval()
         estimator.to(device).eval()
         return actor, estimator
+
+
+# ---------------------------------------------------------------------------
+# LowCmd CRC -- required part of the Unitree wire format, only used by
+# GaitwaysPolicy.build_lowcmd(). Kept at the bottom because it is a
+# self-contained byte-packing utility unrelated to the model.
+# ---------------------------------------------------------------------------
+
+class _RawMotorCmd(ctypes.Structure):
+    _fields_ = [
+        ("mode", ctypes.c_uint8), ("q", ctypes.c_float), ("dq", ctypes.c_float),
+        ("tau", ctypes.c_float), ("kp", ctypes.c_float), ("kd", ctypes.c_float),
+        ("reserve", ctypes.c_uint32 * 3),
+    ]
+
+
+class _RawBmsCmd(ctypes.Structure):
+    _fields_ = [("off", ctypes.c_uint8), ("reserve", ctypes.c_uint8 * 3)]
+
+
+class _RawLowCmd(ctypes.Structure):
+    _fields_ = [
+        ("head", ctypes.c_uint8 * 2), ("level_flag", ctypes.c_uint8),
+        ("frame_reserve", ctypes.c_uint8), ("sn", ctypes.c_uint32 * 2),
+        ("version", ctypes.c_uint32 * 2), ("bandwidth", ctypes.c_uint16),
+        ("motor_cmd", _RawMotorCmd * 20), ("bms_cmd", _RawBmsCmd),
+        ("wireless_remote", ctypes.c_uint8 * 40), ("led", ctypes.c_uint8 * 12),
+        ("fan", ctypes.c_uint8 * 2), ("gpio", ctypes.c_uint8),
+        ("reserve", ctypes.c_uint32), ("crc", ctypes.c_uint32),
+    ]
+
+
+def _copy_into(raw: ctypes.Structure, msg: object) -> None:
+    for name, field_type in raw._fields_:
+        msg_value = getattr(msg, name)
+        raw_value = getattr(raw, name)
+        if issubclass(field_type, ctypes.Structure):
+            _copy_into(raw_value, msg_value)
+        elif issubclass(field_type, ctypes.Array):
+            element_is_struct = issubclass(field_type._type_, ctypes.Structure)
+            for i in range(len(raw_value)):
+                if element_is_struct:
+                    _copy_into(raw_value[i], msg_value[i])
+                else:
+                    raw_value[i] = msg_value[i]
+        else:
+            setattr(raw, name, msg_value)
+
+
+def _fill_crc(msg: LowCmd) -> None:
+    raw = _RawLowCmd()
+    _copy_into(raw, msg)
+    size = ctypes.sizeof(_RawLowCmd) - ctypes.sizeof(ctypes.c_uint32)
+    data = ctypes.string_at(ctypes.byref(raw), size)
+    words = struct.unpack(f"<{size // 4}I", data)
+    msg.crc = Crc32Mpeg2.calc(struct.pack(f">{size // 4}I", *words))
 
 
 if __name__ == "__main__":

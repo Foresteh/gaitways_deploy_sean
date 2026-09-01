@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name), glob(os.path.join(package_name, 'launch', '*launch.py'))),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'crccheck', 'torch'],
     zip_safe=True,
     maintainer='sean',
     maintainer_email='luckysandon3@gmail.com',
