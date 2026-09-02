@@ -60,6 +60,8 @@ Notes:
   `docker exec -it gaitways_docker_sean bash`
 - To re-attach later after the container was stopped:
   `docker start -ai gaitways_docker_sean`
+- To remove a old container:
+  `docker rm gaitways_docker_sean`
 
 ### 1.5 Build the workspace (inside the container)
 
