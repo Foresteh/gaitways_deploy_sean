@@ -4,13 +4,9 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
-
-# import the message type for the joystick input
 from sensor_msgs.msg import Joy
-
-# import the message type for the UnitreeGo2 controls
-from unitree_go.msg import LowCmd # type: ignore
-from unitree_go.msg import LowState # type: ignore
+from unitree_api.msg import Request # type: ignore
+from unitree_go.msg import LowCmd, LowState # type: ignore
 
 from .gaitways_policy import GaitwaysPolicy
 
@@ -51,6 +47,17 @@ class PolicyDeploy(Node):
             '/lowcmd',
             10
         )
+
+        self.release_publisher = self.create_publisher(
+            Request,
+            '/api/motion_switcher/request',
+            10
+        )
+
+        time.sleep(1)
+        release = Request()
+        release.header.identity.api_id = 1003  # ReleaseMode
+        self.release_publisher.publish(release)
 
     def joy_callback(self, msg):
         self._latest_commands[0] = float(msg.axes[1])  # forward/back

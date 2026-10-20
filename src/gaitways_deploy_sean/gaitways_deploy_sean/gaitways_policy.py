@@ -1,44 +1,3 @@
-#!/usr/bin/env python3
-"""
-Standalone GaitWays policy model: input/output only.
-
-This file has ONE job: given the robot's current sensor readings and your
-desired command (from joystick, script, whatever), run the trained model
-and produce a command ready to publish to the robot. `step()` gives you raw
-target joint angles ("numbers in, numbers out"); `build_lowcmd()` wraps that
-plus the Unitree LowCmd/CRC packing so calling code just needs to pass in
-the raw LowState fields and publish the result.
-
-Extracted and simplified from gaitways_deploy's policy_runner.py and
-observation_builder.py. Same model file (model_29999.pt), same math -- just
-stripped of everything ROS/ros2-specific so it can be reused standalone.
-
-Requires: torch
-
-------------------------------------------------------------------------
-HOW TO USE
-------------------------------------------------------------------------
-
-    policy = GaitwaysPolicy("model_29999.pt")
-
-    # once per control step (e.g. 50 Hz):
-    target_joint_angles = policy.step(
-        base_angular_velocity=[0.0, 0.0, 0.0],   # from IMU (rad/s)
-        projected_gravity=[0.0, 0.0, -1.0],      # from IMU (unit vector)
-        current_joint_angles=[...12 values...],  # from motor encoders
-        current_joint_velocities=[...12 values...],
-        commands=[...12 values...],              # your joystick/desired command
-    )
-
-    # target_joint_angles is a list of 12 floats, one per leg joint, in the
-    # SAME physical joint order you passed current_joint_angles in.
-
-    # if you start/stop or teleport the robot, reset the model's memory:
-    policy.reset()
-
-------------------------------------------------------------------------
-"""
-
 import ctypes
 import math
 import struct
@@ -51,29 +10,19 @@ from crccheck.crc import Crc32Mpeg2
 
 from unitree_go.msg import LowCmd  # type: ignore
 
-# ---------------------------------------------------------------------------
-# Fixed sizes -- these come from how the model was trained. Do not change
-# unless you are loading a differently-trained checkpoint.
-# ---------------------------------------------------------------------------
-OBSERVATION_DIM = 73            # total input size to the actor model
-ESTIMATOR_OBSERVATION_DIM = 70  # input size to the velocity-estimator model
+
 NUM_JOINTS = 12
-NUM_COMMANDS = 12
 
 ACTION_CLAMP_MIN = -10.0
 ACTION_CLAMP_MAX = 10.0
 
-# Scales applied to the raw `commands` you provide, before they go into the
-# observation. Taken directly from gaitways_deploy's control_config.yaml.
 COMMANDS_SCALE = [1.0, 1.0, 1.0, 2.0, 0.3, 0.3, 1.0, 1.0, 0.15, 1.0, 1.0, 1.0]
 
-# Default joint angles / safety limits, from gaitways_deploy's
-# control_config.yaml. Order matches `policy_order_indices` below.
 DEFAULT_JOINT_ANGLES = [
-    0.1, 0.8, -1.5,
-    -0.1, 0.8, -1.5,
-    0.1, 1.0, -1.5,
-    -0.1, 1.0, -1.5,
+    -0.1, 0.9, -1.8,
+    0.1, 0.9, -1.8,
+    -0.1, 1.2, -1.8,
+    0.1, 1.2, -1.8,
 ]
 HARD_LOWER_LIMITS = [
     -1.0472, -1.5708, -2.7227,
@@ -87,11 +36,9 @@ HARD_UPPER_LIMITS = [
     1.0472, 4.5379, -0.8378,
     1.0472, 4.5379, -0.8378,
 ]
-# Maps "policy's internal joint order" -> "your physical joint order".
-POLICY_ORDER_INDICES = [0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]
 
-# Maps LowCmd/LowState's motor array slot -> the same physical joint order=
-DEPLOYMENT_ORDER_INDICES = [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8]
+# POLICY_TO_MOTOR[i] = motor slot of the policy's i-th joint.
+POLICY_TO_MOTOR = [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
 
 DEFAULT_ACTION_SCALE = 0.25
 MOTOR_KP = 25.0
@@ -105,49 +52,68 @@ def _rpy_to_projected_gravity(rpy: Sequence[float]) -> list[float]:
     return [sin_p, -cos_p * sin_r, -cos_p * cos_r]
 
 
-# ---------------------------------------------------------------------------
-# Model definition (must match the architecture used at training time)
-# ---------------------------------------------------------------------------
+# --- Model definition (must match the architecture used at training time) ---
+
+class _Memory(nn.Module):
+    """LSTM memory -- makes the model stateful across steps."""
+
+    def __init__(self, *, input_size: int, hidden_size: int) -> None:
+        super().__init__()
+        self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=1)
+        self.hidden_states = None
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        output, self.hidden_states = self.rnn(observation.unsqueeze(0), self.hidden_states)
+        return output.squeeze(0)
+
+
+class _Estimator(nn.Module):
+    """70 numbers in -> 3 numbers out (guessed base linear velocity).
+
+    Exists because a real robot has no direct sensor for its own forward/
+    side/up velocity -- this network guesses it from other sensor data.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        activation = nn.ELU()
+        self.memory_a = _Memory(input_size=70, hidden_size=256)  # 70 = observation minus lin vel
+        self.latent_encoder = nn.Sequential(
+            nn.Linear(256, 256), activation,
+            nn.Linear(256, 128), activation,
+        )
+        self.latent_output = nn.Linear(128, 3)
+
+    def act(self, observation: torch.Tensor) -> torch.Tensor:
+        latent_input = self.memory_a(observation)
+        latent = self.latent_encoder(latent_input)
+        return self.latent_output(latent)
 
 class _FiLM(nn.Module):
     """Lets a small 'gait id' signal modulate the memory layer's input."""
 
-    def __init__(self, gait_code_dim: int, observation_dim: int) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.to_gb = nn.Linear(gait_code_dim, 2 * observation_dim)
+        self.to_gb = nn.Linear(2, 2 * 73)  # gait code -> gamma (scale), beta (shift)
 
     def forward(self, observation: torch.Tensor, gait_code: torch.Tensor) -> torch.Tensor:
         gamma, beta = self.to_gb(gait_code).chunk(2, dim=-1)
         return (1.0 + gamma) * observation + beta
 
 
-class _RecurrentMemory(nn.Module):
-    """The actor's memory (LSTM) -- makes the model stateful across steps."""
+class _GaitMemory(_Memory):
+    """Same LSTM memory, but the gait id modulates its input first (used by the actor)."""
 
-    def __init__(self, *, input_size: int, hidden_size: int) -> None:
-        super().__init__()
-        self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=1)
-        self.hidden_states = None
-        self.gait_emb = nn.Embedding(4, 2)
-        self.film_in = _FiLM(2, input_size)
-
-    # 2-bit binary code per gait id 
-    # 0 trot -> [0,0], 1 pronk -> [0,1], 2 pace -> [1,0], 3 bound -> [1,1].
-    _GAIT_BINARY = torch.tensor([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]])
-
-    @classmethod
-    def _gait_binary(cls, gait_id: torch.Tensor) -> torch.Tensor:
-        return cls._GAIT_BINARY.to(gait_id.device)[gait_id]
+    def __init__(self) -> None:
+        super().__init__(input_size=73, hidden_size=512)
+        self.gait_emb = nn.Embedding(4, 2)  # in the checkpoint, unused
+        self.film_in = _FiLM()
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         gait_id = torch.round(observation[..., -1]).long()
-        gait_code = self._gait_binary(gait_id)
-        modulated_input = self.film_in(observation, gait_code)
-        out, self.hidden_states = self.rnn(modulated_input.unsqueeze(0), self.hidden_states)
-        return out.squeeze(0)
-
-    def reset(self) -> None:
-        self.hidden_states = None
+        # 2-bit code: 0 trot [0,0], 1 pronk [0,1], 2 pace [1,0], 3 bound [1,1]
+        gait_code = torch.stack([(gait_id >> 1) & 1, gait_id & 1], dim=-1).float()
+        return super().forward(self.film_in(observation, gait_code))
 
 
 class _Actor(nn.Module):
@@ -171,70 +137,20 @@ class _Actor(nn.Module):
             nn.Linear(128, 1),
         )
         self.std = nn.Parameter(torch.ones(12))
-        self.memory_a = _RecurrentMemory(input_size=OBSERVATION_DIM, hidden_size=512)
-        self.memory_c = _RecurrentMemory(input_size=OBSERVATION_DIM, hidden_size=512)
+        self.memory_a = _GaitMemory()
+        self.memory_c = _GaitMemory()
 
     def act(self, observation: torch.Tensor) -> torch.Tensor:
         return self.actor(self.memory_a(observation))
 
-    def reset(self) -> None:
-        self.memory_a.reset()
-        self.memory_c.reset()
 
-
-class _EstimatorMemory(nn.Module):
-    def __init__(self, *, input_size: int, hidden_size: int) -> None:
-        super().__init__()
-        self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=1)
-        self.hidden_states = None
-
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        out, self.hidden_states = self.rnn(observation.unsqueeze(0), self.hidden_states)
-        return out.squeeze(0)
-
-    def reset(self) -> None:
-        self.hidden_states = None
-
-
-class _Estimator(nn.Module):
-    """70 numbers in -> 3 numbers out (guessed base linear velocity).
-
-    Exists because a real robot has no direct sensor for its own forward/
-    side/up velocity -- this network guesses it from other sensor data.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        activation = nn.ELU()
-        self.memory_a = _EstimatorMemory(input_size=ESTIMATOR_OBSERVATION_DIM, hidden_size=256)
-        self.latent_encoder = nn.Sequential(
-            nn.Linear(256, 256), activation,
-            nn.Linear(256, 128), activation,
-        )
-        self.latent_output = nn.Linear(128, 3)
-
-    def act(self, observation: torch.Tensor) -> torch.Tensor:
-        latent_input = self.memory_a(observation)
-        latent = self.latent_encoder(latent_input)
-        return self.latent_output(latent)
-
-    def reset(self) -> None:
-        self.memory_a.reset()
-
-
-# ---------------------------------------------------------------------------
-# Gait clock -- produces a repeating signal telling the model where each
-# foot currently is in its walking cycle.
-# ---------------------------------------------------------------------------
+# --- Gait clock: tells the model where each foot is in its walking cycle ---
 
 class _GaitClock:
     TROT, PRONK, PACE, BOUND = 0, 1, 2, 3
 
     def __init__(self, *, step_dt: float) -> None:
         self.step_dt = float(step_dt)
-        self._t_global = 0.0
-
-    def reset(self) -> None:
         self._t_global = 0.0
 
     def step(self, *, gait_frequency: float, gait_phase: float, gait_id: float) -> list[float]:
@@ -260,48 +176,20 @@ class _GaitClock:
         return [math.sin(2.0 * math.pi * t) for t in t_foot]
 
 
-# ---------------------------------------------------------------------------
-# The one class you actually use
-# ---------------------------------------------------------------------------
+# --- Policy: sensor readings + joystick commands -> joint targets via the trained model ---
 
 class GaitwaysPolicy:
     """Loads the model once, then call `.step(...)` every control tick."""
 
-    def __init__(
-        self,
-        model_path: str | Path,
-        *,
-        default_joint_angles: Sequence[float] = DEFAULT_JOINT_ANGLES,
-        hard_lower_limits: Sequence[float] = HARD_LOWER_LIMITS,
-        hard_upper_limits: Sequence[float] = HARD_UPPER_LIMITS,
-        policy_order_indices: Sequence[int] = POLICY_ORDER_INDICES,
-        action_scale: float = DEFAULT_ACTION_SCALE,
-        control_dt: float = 1.0 / 50.0,
-        use_cuda: bool = True,
-    ) -> None:
-        self.default_joint_angles = [float(v) for v in default_joint_angles]
-        self.hard_lower_limits = [float(v) for v in hard_lower_limits]
-        self.hard_upper_limits = [float(v) for v in hard_upper_limits]
-        self.policy_order_indices = [int(v) for v in policy_order_indices]
-        self.action_scale = float(action_scale)
-
+    def __init__(self, model_path: str | Path, *, use_cuda: bool = True) -> None:
         self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
         self.actor, self.estimator = self._load(Path(model_path), self.device)
 
-        self.clock = _GaitClock(step_dt=control_dt)
+        self.clock = _GaitClock(step_dt=1.0 / 50.0)
         self._action_t = [0.0] * NUM_JOINTS
         self._action_t_minus_1 = [0.0] * NUM_JOINTS
 
     # -- public API ----------------------------------------------------
-
-    def reset(self) -> None:
-        """Call this whenever you start a new control session (the model
-        has memory across steps, so old state should not carry over)."""
-        self.actor.reset()
-        self.estimator.reset()
-        self.clock.reset()
-        self._action_t = [0.0] * NUM_JOINTS
-        self._action_t_minus_1 = [0.0] * NUM_JOINTS
 
     def step(
         self,
@@ -310,28 +198,49 @@ class GaitwaysPolicy:
         projected_gravity: Sequence[float],       # 3 values, unit vector
         current_joint_angles: Sequence[float],    # 12 values, rad
         current_joint_velocities: Sequence[float],  # 12 values, rad/s
-        commands: Sequence[float],                # 12 values -- see NOTE below
+        commands: Sequence[float],                # 12 values -- see docstring
     ) -> list[float]:
         """Run one control step. Returns 12 target joint angles (rad), in
-        the same physical joint order you passed the inputs in.
+        motor order.
 
-        NOTE on `commands`: this is the same 12-value vector
-        gaitways_deploy's GaitCommand message carries. Three of its slots
-        are NOT just "raw command values" fed to the model -- they also
-        drive the internal gait clock:
-            commands[6]  = gait_frequency
-            commands[7]  = gait_phase
-            commands[11] = gait_id (0=trot, 1=pronk, 2=pace, 3=bound)
-        All 12 values (including those three) are still scaled by
-        COMMANDS_SCALE and placed in the observation as normal.
+        commands[6], [7] and [11] (gait frequency, phase, id) also drive the
+        gait clock; all 12 are scaled by COMMANDS_SCALE into the observation.
         """
 
-        observation = self._build_observation(
-            base_angular_velocity=base_angular_velocity,
-            projected_gravity=projected_gravity,
-            current_joint_angles=current_joint_angles,
-            current_joint_velocities=current_joint_velocities,
-            commands=commands,
+        commands = [float(c) for c in commands]
+
+        # Joint position/velocity are re-ordered from motor order into the
+        # policy's order (same mapping used for the output action), and
+        # compared against each joint's default.
+        joint_pos_error = [0.0] * NUM_JOINTS
+        joint_vel_scaled = [0.0] * NUM_JOINTS
+        for policy_idx, motor_idx in enumerate(POLICY_TO_MOTOR):
+            joint_pos_error[policy_idx] = (
+                float(current_joint_angles[motor_idx]) - DEFAULT_JOINT_ANGLES[motor_idx]
+            )
+            joint_vel_scaled[policy_idx] = 0.05 * float(current_joint_velocities[motor_idx])
+
+        commands_scaled = [c * s for c, s in zip(commands, COMMANDS_SCALE)]
+
+        # The gait clock is driven by specific slots inside `commands`,
+        # not by fixed config values -- this matches gaitways_deploy's
+        # GaitCommand message layout.
+        clock_inputs = self.clock.step(
+            gait_frequency=commands[6],
+            gait_phase=commands[7],
+            gait_id=commands[11],
+        )
+
+        observation = (
+            [0.0, 0.0, 0.0]                       # placeholder for base_lin_vel
+            + [float(v) for v in base_angular_velocity]
+            + [float(v) for v in projected_gravity]
+            + joint_pos_error
+            + joint_vel_scaled
+            + self._action_t
+            + self._action_t_minus_1
+            + clock_inputs
+            + commands_scaled
         )
 
         obs_tensor = torch.tensor([observation], dtype=torch.float32, device=self.device)
@@ -363,12 +272,8 @@ class GaitwaysPolicy:
         commands vector, runs the model, and returns a ready-to-publish
         LowCmd (CRC included)."""
 
-        current_joint_angles = [0.0] * NUM_JOINTS
-        current_joint_velocities = [0.0] * NUM_JOINTS
-        for motor_idx in range(NUM_JOINTS):
-            base_idx = DEPLOYMENT_ORDER_INDICES[motor_idx]
-            current_joint_angles[base_idx] = float(motor_state[motor_idx].q)
-            current_joint_velocities[base_idx] = float(motor_state[motor_idx].dq)
+        current_joint_angles = [motor_state[i].q for i in range(NUM_JOINTS)]
+        current_joint_velocities = [motor_state[i].dq for i in range(NUM_JOINTS)]
 
         target_joint_angles = self.step(
             base_angular_velocity=list(imu_state.gyroscope[0:3]),
@@ -383,10 +288,9 @@ class GaitwaysPolicy:
         cmd.head[1] = 0xEF
         cmd.level_flag = 0xFF
         for motor_idx in range(NUM_JOINTS):
-            base_idx = DEPLOYMENT_ORDER_INDICES[motor_idx]
             motor = cmd.motor_cmd[motor_idx]
             motor.mode = 0x01
-            motor.q = float(target_joint_angles[base_idx])
+            motor.q = float(target_joint_angles[motor_idx])
             motor.dq = 0.0
             motor.kp = MOTOR_KP
             motor.kd = MOTOR_KD
@@ -396,57 +300,12 @@ class GaitwaysPolicy:
 
     # -- internals -------------------------------------------------------
 
-    def _build_observation(
-        self,
-        *,
-        base_angular_velocity: Sequence[float],
-        projected_gravity: Sequence[float],
-        current_joint_angles: Sequence[float],
-        current_joint_velocities: Sequence[float],
-        commands: Sequence[float],
-    ) -> list[float]:
-        commands = [float(c) for c in commands]
-
-        # Joint position/velocity are re-ordered from your physical joint
-        # order into the policy's internal order (same mapping used for
-        # the output action), and compared against each joint's default.
-        joint_pos_error = [0.0] * NUM_JOINTS
-        joint_vel_scaled = [0.0] * NUM_JOINTS
-        for policy_idx, base_idx in enumerate(self.policy_order_indices):
-            joint_pos_error[policy_idx] = (
-                float(current_joint_angles[base_idx]) - self.default_joint_angles[base_idx]
-            )
-            joint_vel_scaled[policy_idx] = 0.05 * float(current_joint_velocities[base_idx])
-
-        commands_scaled = [c * s for c, s in zip(commands, COMMANDS_SCALE)]
-
-        # The gait clock is driven by specific slots inside `commands`,
-        # not by fixed config values -- this matches gaitways_deploy's
-        # GaitCommand message layout.
-        clock_inputs = self.clock.step(
-            gait_frequency=commands[6],
-            gait_phase=commands[7],
-            gait_id=commands[11],
-        )
-
-        return (
-            [0.0, 0.0, 0.0]                       # placeholder for base_lin_vel
-            + [float(v) for v in base_angular_velocity]
-            + [float(v) for v in projected_gravity]
-            + joint_pos_error
-            + joint_vel_scaled
-            + self._action_t
-            + self._action_t_minus_1
-            + clock_inputs
-            + commands_scaled
-        )
-
     def _action_to_target_joint_angles(self, raw_action: list[float]) -> list[float]:
-        target_joint_angles = list(self.default_joint_angles)
-        for policy_idx, base_idx in enumerate(self.policy_order_indices):
-            angle = self.default_joint_angles[base_idx] + self.action_scale * raw_action[policy_idx]
-            angle = max(self.hard_lower_limits[base_idx], min(self.hard_upper_limits[base_idx], angle))
-            target_joint_angles[base_idx] = angle
+        target_joint_angles = list(DEFAULT_JOINT_ANGLES)
+        for policy_idx, motor_idx in enumerate(POLICY_TO_MOTOR):
+            angle = DEFAULT_JOINT_ANGLES[motor_idx] + DEFAULT_ACTION_SCALE * raw_action[policy_idx]
+            angle = max(HARD_LOWER_LIMITS[motor_idx], min(HARD_UPPER_LIMITS[motor_idx], angle))
+            target_joint_angles[motor_idx] = angle
         return target_joint_angles
 
     @staticmethod
@@ -461,11 +320,7 @@ class GaitwaysPolicy:
         return actor, estimator
 
 
-# ---------------------------------------------------------------------------
-# LowCmd CRC -- required part of the Unitree wire format, only used by
-# GaitwaysPolicy.build_lowcmd(). Kept at the bottom because it is a
-# self-contained byte-packing utility unrelated to the model.
-# ---------------------------------------------------------------------------
+# --- LowCmd CRC: fills in the CRC-32 checksum ---
 
 class _RawMotorCmd(ctypes.Structure):
     _fields_ = [
@@ -515,27 +370,3 @@ def _fill_crc(msg: LowCmd) -> None:
     data = ctypes.string_at(ctypes.byref(raw), size)
     words = struct.unpack(f"<{size // 4}I", data)
     msg.crc = Crc32Mpeg2.calc(struct.pack(f">{size // 4}I", *words))
-
-
-if __name__ == "__main__":
-    # Quick smoke test -- run this file directly with a model path to
-    # confirm it loads and produces output.
-    import sys
-
-    if len(sys.argv) != 2:
-        print("Usage: python gaitways_policy.py <path-to-model.pt>")
-        raise SystemExit(1)
-
-    policy = GaitwaysPolicy(sys.argv[1], use_cuda=False)
-    commands = [0.0] * NUM_COMMANDS
-    commands[6] = 3.0   # gait_frequency (must be > 0)
-    commands[7] = 0.5   # gait_phase
-    commands[11] = 0.0  # gait_id: 0=trot
-    result = policy.step(
-        base_angular_velocity=[0.0, 0.0, 0.0],
-        projected_gravity=[0.0, 0.0, -1.0],
-        current_joint_angles=DEFAULT_JOINT_ANGLES,
-        current_joint_velocities=[0.0] * NUM_JOINTS,
-        commands=commands,
-    )
-    print("target_joint_angles:", result)
