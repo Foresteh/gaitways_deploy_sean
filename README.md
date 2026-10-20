@@ -89,3 +89,11 @@ ros2 launch gaitways_deploy_sean sim_launch.py
 You should see the MuJoCo viewer appear with the Go2 standing on flat ground.
 Use the joystick to drive it. If the viewer does not appear, re-run
 `xhost +local:docker` on the host and restart the container.
+
+
+## 2. Run in Real
+
+```bash
+# inside the container, from /root/ros2_ws, with the workspace sourced
+ros2 launch gaitways_deploy_sean gaitways_launch.py
+```
