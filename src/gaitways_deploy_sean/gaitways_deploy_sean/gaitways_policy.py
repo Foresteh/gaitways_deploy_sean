@@ -297,7 +297,7 @@ class GaitwaysPolicy:
         return actor, estimator
 
 
-def make_lowcmd(target_joint_angles: Sequence[float]) -> LowCmd:
+def make_lowcmd(target_joint_angles: Sequence[float], kp: float = MOTOR_KP) -> LowCmd:
     """12 joint targets (motor order) -> ready-to-publish LowCmd."""
     cmd = LowCmd()
     cmd.head[0] = 0xFE
@@ -308,7 +308,7 @@ def make_lowcmd(target_joint_angles: Sequence[float]) -> LowCmd:
         motor.mode = 0x01
         motor.q = target_joint_angles[motor_idx]
         motor.dq = 0.0
-        motor.kp = MOTOR_KP
+        motor.kp = kp
         motor.kd = MOTOR_KD
         motor.tau = 0.0
     _fill_crc(cmd)
@@ -365,3 +365,4 @@ def _fill_crc(msg: LowCmd) -> None:
     data = ctypes.string_at(ctypes.byref(raw), size)
     words = struct.unpack(f"<{size // 4}I", data)
     msg.crc = Crc32Mpeg2.calc(struct.pack(f">{size // 4}I", *words))
+

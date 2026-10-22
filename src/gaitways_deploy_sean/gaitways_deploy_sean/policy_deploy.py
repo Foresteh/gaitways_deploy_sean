@@ -15,7 +15,7 @@ from unitree_go.msg import LowState # type: ignore
 # import the message type for Unitree API requests (used to release sport mode)
 from unitree_api.msg import Request # type: ignore
 
-from .gaitways_policy import REST_JOINT_ANGLES, GaitwaysPolicy, make_lowcmd
+from .gaitways_policy import DEFAULT_JOINT_ANGLES, REST_JOINT_ANGLES, GaitwaysPolicy, make_lowcmd
 
 
 class PolicyDeploy(Node):
@@ -75,13 +75,15 @@ class PolicyDeploy(Node):
         self.release_publisher.publish(release)
 
     def joy_callback(self, msg):
-        if msg.buttons[4] and not self.last_select:  # Back/Select
+        if msg.buttons[6] and not self.last_select:  # Back/Select
             self.on = not self.on
-        self.last_select = msg.buttons[4]
+        self.last_select = msg.buttons[6]
 
         self._latest_commands[0] = float(msg.axes[1])  # forward/back
         self._latest_commands[1] = float(msg.axes[0])  # left/right
         self._latest_commands[2] = float(msg.axes[3])  # turn
+        self._latest_commands[4] = 0.4 * msg.axes[8]  # D-pad up/down: pitch
+        self._latest_commands[5] = 0.2 * msg.axes[7]  # D-pad left/right: roll
 
         if msg.buttons[0]:    # A: trot
             self._latest_commands[11] = 0.0
@@ -93,28 +95,28 @@ class PolicyDeploy(Node):
             self._latest_commands[11] = 3.0
 
     def state_callback(self, msg):
+        if self.on == self.sitting:  # robot isn't in the pose Select asked for
+            self.move(msg, DEFAULT_JOINT_ANGLES if self.on else REST_JOINT_ANGLES)
+            self.sitting = not self.on
+            return
         if not self.on:
-            if not self.sitting:
-                self.sit(msg)
             return
         now = time.monotonic()
         if now - self.last_run < 0.02:
             return
         self.last_run = now
 
-        self.sitting = False
         cmd = self.policy.build_lowcmd(msg.motor_state, msg.imu_state, self._latest_commands)
         self.publisher.publish(cmd)
 
-    def sit(self, msg):
-        # Move from the current pose to the lying pose over 3 s
+    def move(self, msg, pose):
+        # Move from the current pose to `pose` over 3 s
         start = [msg.motor_state[i].q for i in range(12)]
         for step in range(1, 151):
             a = step / 150
-            pose = [s + a * (r - s) for s, r in zip(start, REST_JOINT_ANGLES)]
-            self.publisher.publish(make_lowcmd(pose))
+            a = a * a * (3 - 2 * a)  # ease in and out
+            self.publisher.publish(make_lowcmd([s + a * (p - s) for s, p in zip(start, pose)], 50.0))
             time.sleep(0.02)
-        self.sitting = True
         self.policy = GaitwaysPolicy(str(Path(__file__).parent / 'model_29999.pt'))  # fresh memory for the next walk
 
 
@@ -130,3 +132,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
