@@ -13,9 +13,6 @@ from unitree_go.msg import LowCmd  # type: ignore
 
 NUM_JOINTS = 12
 
-ACTION_CLAMP_MIN = -10.0
-ACTION_CLAMP_MAX = 10.0
-
 COMMANDS_SCALE = [1.0, 1.0, 1.0, 2.0, 0.3, 0.3, 1.0, 1.0, 0.15, 1.0, 1.0, 1.0]
 
 DEFAULT_JOINT_ANGLES = [
@@ -23,6 +20,13 @@ DEFAULT_JOINT_ANGLES = [
     0.1, 0.9, -1.8,
     -0.1, 1.2, -1.8,
     0.1, 1.2, -1.8,
+]
+# Lying down pose (master's proning_joint_angles, in motor order)
+REST_JOINT_ANGLES = [
+    0.2, 1.3, -2.6,
+    -0.2, 1.3, -2.6,
+    -0.3, 1.3, -2.6,
+    0.3, 1.3, -2.6,
 ]
 HARD_LOWER_LIMITS = [
     -1.0472, -1.5708, -2.7227,
@@ -45,6 +49,7 @@ MOTOR_KP = 25.0
 MOTOR_KD = 0.5
 
 
+
 def _rpy_to_projected_gravity(rpy: Sequence[float]) -> list[float]:
     roll, pitch, _yaw = rpy
     sin_p, cos_p = math.sin(pitch), math.cos(pitch)
@@ -57,7 +62,7 @@ def _rpy_to_projected_gravity(rpy: Sequence[float]) -> list[float]:
 class _Memory(nn.Module):
     """LSTM memory -- makes the model stateful across steps."""
 
-    def __init__(self, *, input_size: int, hidden_size: int) -> None:
+    def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
         self.rnn = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=1)
         self.hidden_states = None
@@ -111,7 +116,7 @@ class _GaitMemory(_Memory):
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         gait_id = torch.round(observation[..., -1]).long()
-        # 2-bit code: 0 trot [0,0], 1 pronk [0,1], 2 pace [1,0], 3 bound [1,1]
+        # gait_id -> gait_code: 0 trot [0,0], 1 pronk [0,1], 2 pace [1,0], 3 bound [1,1]
         gait_code = torch.stack([(gait_id >> 1) & 1, gait_id & 1], dim=-1).float()
         return super().forward(self.film_in(observation, gait_code))
 
@@ -149,12 +154,11 @@ class _Actor(nn.Module):
 class _GaitClock:
     TROT, PRONK, PACE, BOUND = 0, 1, 2, 3
 
-    def __init__(self, *, step_dt: float) -> None:
-        self.step_dt = float(step_dt)
+    def __init__(self, step_dt: float) -> None:
+        self.step_dt = step_dt
         self._t_global = 0.0
 
-    def step(self, *, gait_frequency: float, gait_phase: float, gait_id: float) -> list[float]:
-        gait_id = int(round(float(gait_id)))
+    def step(self, gait_frequency: float, gait_phase: float, gait_id: float) -> list[float]:
         self._t_global = (self._t_global + self.step_dt * gait_frequency) % 1.0
         if gait_id == self.PRONK:
             theta1, theta2, theta3 = 0.0, 0.0, 0.0
@@ -164,8 +168,6 @@ class _GaitClock:
             theta1, theta2, theta3 = 0.0, gait_phase, 0.0
         elif gait_id == self.BOUND:
             theta1, theta2, theta3 = 0.0, 0.0, gait_phase
-        else:
-            raise ValueError(f"Unsupported gait_id: {gait_id}")
 
         t_foot = [
             (self._t_global + theta1 + theta2 + theta3) % 1.0,
@@ -175,14 +177,13 @@ class _GaitClock:
         ]
         return [math.sin(2.0 * math.pi * t) for t in t_foot]
 
-
 # --- Policy: sensor readings + joystick commands -> joint targets via the trained model ---
 
 class GaitwaysPolicy:
     """Loads the model once, then call `.step(...)` every control tick."""
 
-    def __init__(self, model_path: str | Path, *, use_cuda: bool = True) -> None:
-        self.device = torch.device("cuda" if use_cuda and torch.cuda.is_available() else "cpu")
+    def __init__(self, model_path: str | Path) -> None:
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.actor, self.estimator = self._load(Path(model_path), self.device)
 
         self.clock = _GaitClock(step_dt=1.0 / 50.0)
@@ -193,7 +194,6 @@ class GaitwaysPolicy:
 
     def step(
         self,
-        *,
         base_angular_velocity: Sequence[float],   # 3 values, rad/s
         projected_gravity: Sequence[float],       # 3 values, unit vector
         current_joint_angles: Sequence[float],    # 12 values, rad
@@ -207,18 +207,11 @@ class GaitwaysPolicy:
         gait clock; all 12 are scaled by COMMANDS_SCALE into the observation.
         """
 
-        commands = [float(c) for c in commands]
-
         # Joint position/velocity are re-ordered from motor order into the
         # policy's order (same mapping used for the output action), and
         # compared against each joint's default.
-        joint_pos_error = [0.0] * NUM_JOINTS
-        joint_vel_scaled = [0.0] * NUM_JOINTS
-        for policy_idx, motor_idx in enumerate(POLICY_TO_MOTOR):
-            joint_pos_error[policy_idx] = (
-                float(current_joint_angles[motor_idx]) - DEFAULT_JOINT_ANGLES[motor_idx]
-            )
-            joint_vel_scaled[policy_idx] = 0.05 * float(current_joint_velocities[motor_idx])
+        joint_pos_error = [current_joint_angles[m] - DEFAULT_JOINT_ANGLES[m] for m in POLICY_TO_MOTOR]
+        joint_vel_scaled = [0.05 * current_joint_velocities[m] for m in POLICY_TO_MOTOR]
 
         commands_scaled = [c * s for c, s in zip(commands, COMMANDS_SCALE)]
 
@@ -233,8 +226,8 @@ class GaitwaysPolicy:
 
         observation = (
             [0.0, 0.0, 0.0]                       # placeholder for base_lin_vel
-            + [float(v) for v in base_angular_velocity]
-            + [float(v) for v in projected_gravity]
+            + base_angular_velocity
+            + projected_gravity
             + joint_pos_error
             + joint_vel_scaled
             + self._action_t
@@ -255,10 +248,7 @@ class GaitwaysPolicy:
             )
             raw_action = self.actor.act(policy_observation).squeeze(0)
 
-        raw_action = [
-            max(ACTION_CLAMP_MIN, min(ACTION_CLAMP_MAX, float(v)))
-            for v in raw_action.detach().cpu().tolist()
-        ]
+        raw_action = raw_action.clamp(-10.0, 10.0).tolist()
 
         target_joint_angles = self._action_to_target_joint_angles(raw_action)
 
@@ -276,27 +266,14 @@ class GaitwaysPolicy:
         current_joint_velocities = [motor_state[i].dq for i in range(NUM_JOINTS)]
 
         target_joint_angles = self.step(
-            base_angular_velocity=list(imu_state.gyroscope[0:3]),
-            projected_gravity=_rpy_to_projected_gravity(imu_state.rpy[0:3]),
+            base_angular_velocity=list(imu_state.gyroscope),
+            projected_gravity=_rpy_to_projected_gravity(imu_state.rpy),
             current_joint_angles=current_joint_angles,
             current_joint_velocities=current_joint_velocities,
             commands=commands,
         )
 
-        cmd = LowCmd()
-        cmd.head[0] = 0xFE
-        cmd.head[1] = 0xEF
-        cmd.level_flag = 0xFF
-        for motor_idx in range(NUM_JOINTS):
-            motor = cmd.motor_cmd[motor_idx]
-            motor.mode = 0x01
-            motor.q = float(target_joint_angles[motor_idx])
-            motor.dq = 0.0
-            motor.kp = MOTOR_KP
-            motor.kd = MOTOR_KD
-            motor.tau = 0.0
-        _fill_crc(cmd)
-        return cmd
+        return make_lowcmd(target_joint_angles)
 
     # -- internals -------------------------------------------------------
 
@@ -313,11 +290,29 @@ class GaitwaysPolicy:
         checkpoint = torch.load(model_path.as_posix(), map_location=device)
         actor = _Actor()
         estimator = _Estimator()
-        actor.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        estimator.load_state_dict(checkpoint["estimator_state_dict"], strict=True)
+        actor.load_state_dict(checkpoint["model_state_dict"])
+        estimator.load_state_dict(checkpoint["estimator_state_dict"])
         actor.to(device).eval()
         estimator.to(device).eval()
         return actor, estimator
+
+
+def make_lowcmd(target_joint_angles: Sequence[float]) -> LowCmd:
+    """12 joint targets (motor order) -> ready-to-publish LowCmd."""
+    cmd = LowCmd()
+    cmd.head[0] = 0xFE
+    cmd.head[1] = 0xEF
+    cmd.level_flag = 0xFF
+    for motor_idx in range(NUM_JOINTS):
+        motor = cmd.motor_cmd[motor_idx]
+        motor.mode = 0x01
+        motor.q = target_joint_angles[motor_idx]
+        motor.dq = 0.0
+        motor.kp = MOTOR_KP
+        motor.kd = MOTOR_KD
+        motor.tau = 0.0
+    _fill_crc(cmd)
+    return cmd
 
 
 # --- LowCmd CRC: fills in the CRC-32 checksum ---
